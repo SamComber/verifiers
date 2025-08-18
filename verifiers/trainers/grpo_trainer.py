@@ -241,6 +241,32 @@ def nanmax(tensor: torch.Tensor) -> torch.Tensor:
     return torch.max(tensor[~torch.isnan(tensor)])
 
 
+def entropy_from_logits_memory_efficient(logits: torch.Tensor, chunk_size: int = 32):
+    """
+    Compute entropy by processing sequence positions in chunks.
+    Args:
+        logits: (B, L, V) tensor
+        chunk_size: Number of sequence positions to process at once
+    """
+    with torch.no_grad():
+
+        B, L, V = logits.shape
+        entropy = torch.empty(B, L, device=logits.device, dtype=logits.dtype)
+
+        for start_idx in range(0, L, chunk_size):
+            end_idx = min(start_idx + chunk_size, L)
+            logits_chunk = logits[:, start_idx:end_idx, :]  # (B, chunk_size, V)
+
+            # More memory-efficient entropy calculation
+            log_probs = torch.log_softmax(logits_chunk, dim=-1)
+            probs = torch.softmax(logits_chunk, dim=-1)
+            entropy_chunk = -(probs * log_probs).sum(dim=-1)  # (B, chunk_size)
+
+            entropy[:, start_idx:end_idx] = entropy_chunk
+        
+        return entropy
+
+
 class GRPOTrainer(Trainer):
     def __init__(
         self,
@@ -496,6 +522,7 @@ class GRPOTrainer(Trainer):
         self.log_completions = args.log_completions
         self.wandb_log_unique_prompts = args.wandb_log_unique_prompts
         self.num_completions_to_print = args.num_completions_to_print
+        self.log_policy_entropy = args.log_policy_entropy
 
         # Environment integration parameters
         self.mask_env_responses = args.mask_env_responses
@@ -714,12 +741,14 @@ class GRPOTrainer(Trainer):
 
     # Get the per-token log probabilities for the completions for the model and the reference model
     def _get_per_token_logps(
-        self, model, input_ids, attention_mask, logits_to_keep, batch_size=None
-    ) -> torch.Tensor:
+        self, model, input_ids, attention_mask, logits_to_keep, batch_size=None, compute_entropy=False
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         batch_size = batch_size or input_ids.size(
             0
         )  # Chunk inputs into smaller batches to reduce memory peak
         all_logps = []
+        all_entropies = []
+
         for i in range(0, input_ids.size(0), batch_size):
             input_ids_batch = input_ids[i : i + batch_size]
             attention_mask_batch = attention_mask[i : i + batch_size]
@@ -731,6 +760,7 @@ class GRPOTrainer(Trainer):
             logits = logits[
                 :, :-1, :
             ]  # (B, L-1, V), exclude the last logit: it corresponds to the next token pred
+
             input_ids_batch = input_ids_batch[:, -logits_to_keep:]
             # For transformers<=4.48, logits_to_keep argument isn't supported, so here we drop logits ourselves.
             # See https://github.com/huggingface/trl/issues/2770
@@ -738,11 +768,23 @@ class GRPOTrainer(Trainer):
             # Divide logits by sampling temperature.
             # See https://huggingface.co/blog/the_n_implementation_details_of_rlhf_with_ppo#policy-training-implementation-details
             logits = logits / self.temperature
+
+            if compute_entropy:
+                entropy = entropy_from_logits_memory_efficient(logits, chunk_size=32)
+                all_entropies.append(entropy)
+
             logps = selective_log_softmax(
                 logits, input_ids_batch
             )  # compute logprobs for the input tokens
             all_logps.append(logps)
-        return torch.cat(all_logps, dim=0)
+
+        logps_result = torch.cat(all_logps, dim=0)
+
+        if compute_entropy:
+            entropies_result = torch.cat(all_entropies, dim=0)
+            return logps_result, entropies_result
+        else:
+            return logps_result, None
 
     def _move_model_to_vllm(self):
         # For DeepSpeed ZeRO-3 we need to gather all parameters before operations
@@ -1187,8 +1229,8 @@ class GRPOTrainer(Trainer):
         # prompt is at least 1 token
         completion_mask = attention_mask[:, 1:]
         logits_to_keep = completion_mask.size(1)
-        per_token_logps = self._get_per_token_logps(
-            model, input_ids, attention_mask, logits_to_keep
+        per_token_logps, per_token_entropy = self._get_per_token_logps(
+            model, input_ids, attention_mask, logits_to_keep, compute_entropy=self.log_policy_entropy
         )
         # Compute the loss
         advantages = inputs["advantages"]
@@ -1218,12 +1260,12 @@ class GRPOTrainer(Trainer):
         if self.beta != 0.0:
             with torch.no_grad():
                 if self.ref_model is not None:
-                    ref_per_token_logps = self._get_per_token_logps(
+                    ref_per_token_logps, _ = self._get_per_token_logps(
                         self.ref_model, input_ids, attention_mask, logits_to_keep
                     )
                 else:
                     with self.accelerator.unwrap_model(self.model).disable_adapter():  # type: ignore
-                        ref_per_token_logps = self._get_per_token_logps(
+                        ref_per_token_logps, _ = self._get_per_token_logps(
                             self.model, input_ids, attention_mask, logits_to_keep
                         )
             per_token_kl = (
@@ -1281,6 +1323,17 @@ class GRPOTrainer(Trainer):
         self._metrics[mode]["clip_ratio/region_mean"].append(
             gathered_clip_ratio.nanmean().item()  # type: ignore
         )
+
+        if self.log_policy_entropy:
+            masked_entropy = per_token_entropy * completion_mask
+            total_completion_tokens = completion_mask.sum()
+            if total_completion_tokens > 0:
+                mean_entropy = masked_entropy.sum() / total_completion_tokens
+                gathered_entropy = self.accelerator.gather_for_metrics(mean_entropy)
+                self._metrics[mode]["entropy/mean"].append(gathered_entropy.nanmean().item())
+                self._metrics[mode]["entropy/min"].append(nanmin(gathered_entropy).item())
+                self._metrics[mode]["entropy/max"].append(nanmax(gathered_entropy).item())
+
         return loss
 
     def _sanitize_tool_calls(
