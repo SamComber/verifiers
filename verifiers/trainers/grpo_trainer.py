@@ -241,7 +241,7 @@ def nanmax(tensor: torch.Tensor) -> torch.Tensor:
     return torch.max(tensor[~torch.isnan(tensor)])
 
 
-def entropy_from_logits_memory_efficient(logits: torch.Tensor, chunk_size: int = 32):
+def entropy_from_logits_memory_efficient(logits: torch.Tensor, chunk_size: int = 4):
     """
     Compute entropy by processing sequence positions in chunks.
     Args:
