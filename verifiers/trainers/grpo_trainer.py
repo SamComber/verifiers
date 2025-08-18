@@ -1327,12 +1327,14 @@ class GRPOTrainer(Trainer):
         if self.log_policy_entropy:
             masked_entropy = per_token_entropy * completion_mask
             total_completion_tokens = completion_mask.sum()
+            
             if total_completion_tokens > 0:
-                mean_entropy = masked_entropy.sum() / total_completion_tokens
-                gathered_entropy = self.accelerator.gather_for_metrics(mean_entropy)
-                self._metrics[mode]["entropy/mean"].append(gathered_entropy.nanmean().item())
-                self._metrics[mode]["entropy/min"].append(nanmin(gathered_entropy).item())
-                self._metrics[mode]["entropy/max"].append(nanmax(gathered_entropy).item())
+                valid_entropy_values = masked_entropy[completion_mask.bool()]                
+                gathered_entropy_values = self.accelerator.gather_for_metrics(valid_entropy_values)
+                
+                self._metrics[mode]["entropy/mean"].append(gathered_entropy_values.nanmean().item())
+                self._metrics[mode]["entropy/min"].append(nanmin(gathered_entropy_values).item())
+                self._metrics[mode]["entropy/max"].append(nanmax(gathered_entropy_values).item())                
 
         return loss
 
