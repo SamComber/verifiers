@@ -22,7 +22,7 @@ from transformers.trainer_callback import TrainerCallback
 from transformers.trainer_utils import seed_worker
 from trl.models import create_reference_model, prepare_deepspeed
 from trl.trainer.callbacks import SyncRefModelCallback
-from trl.trainer.utils import disable_dropout_in_model, pad, selective_log_softmax
+from trl.trainer.utils import disable_dropout_in_model, pad, selective_log_softmax, entropy_from_logits
 
 from verifiers import Environment
 from verifiers.trainers.async_batch_generator import AsyncBatchGenerator, BatchRequest
@@ -240,31 +240,6 @@ def nanmax(tensor: torch.Tensor) -> torch.Tensor:
         return torch.tensor(float("nan"), dtype=tensor.dtype, device=tensor.device)
     return torch.max(tensor[~torch.isnan(tensor)])
 
-
-def entropy_from_logits_memory_efficient(logits: torch.Tensor, chunk_size: int = 4):
-    """
-    Compute entropy by processing sequence positions in chunks.
-    Args:
-        logits: (B, L, V) tensor
-        chunk_size: Number of sequence positions to process at once
-    """
-    with torch.no_grad():
-
-        B, L, V = logits.shape
-        entropy = torch.empty(B, L, device=logits.device, dtype=logits.dtype)
-
-        for start_idx in range(0, L, chunk_size):
-            end_idx = min(start_idx + chunk_size, L)
-            logits_chunk = logits[:, start_idx:end_idx, :]  # (B, chunk_size, V)
-
-            # More memory-efficient entropy calculation
-            log_probs = torch.log_softmax(logits_chunk, dim=-1)
-            probs = torch.softmax(logits_chunk, dim=-1)
-            entropy_chunk = -(probs * log_probs).sum(dim=-1)  # (B, chunk_size)
-
-            entropy[:, start_idx:end_idx] = entropy_chunk
-        
-        return entropy
 
 
 class GRPOTrainer(Trainer):
@@ -770,7 +745,7 @@ class GRPOTrainer(Trainer):
             logits = logits / self.temperature
 
             if compute_entropy:
-                entropy = entropy_from_logits_memory_efficient(logits, chunk_size=32)
+                entropy = entropy_from_logits(logits)
                 all_entropies.append(entropy)
 
             logps = selective_log_softmax(
